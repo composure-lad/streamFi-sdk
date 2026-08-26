@@ -107,8 +107,13 @@ export function subscribeToStream(
         }
       }
 
-      if (response.cursor) {
-        cursor = response.cursor;
+      // Soroban RPC returns a cursor in the response, but
+      // @stellar/stellar-sdk's GetEventsResponse type (v12.x) does not
+      // declare it — read it through a narrow cast so multi-page event
+      // polling keeps working (see #422).
+      const nextCursor = (response as { cursor?: string }).cursor;
+      if (nextCursor) {
+        cursor = nextCursor;
       } else {
         cursor = undefined;
         if (response.latestLedger !== undefined) {

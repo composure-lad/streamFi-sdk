@@ -133,7 +133,8 @@ export class StreamsModule {
       const pk = this.activeWallet.getPublicKey();
       if (typeof pk === 'string') return pk;
     }
-    if (this.config.signer) return this.config.signer.publicKey();
+    const signer = this._signer();
+    if (signer) return signer.publicKey();
     if (this.config.keypair) return this.config.keypair.publicKey();
     return ZERO_ADDR;
   }
@@ -521,13 +522,17 @@ export class StreamsModule {
       throw new Error(`Simulation failed: ${simResult.error}`);
     }
 
-    const resourceFee = Number(simResult.minResourceFee);
-    const cpuInstructions = Number(simResult.cost.cpuInsns);
+    // All fees are bigint stroops — consistent with FeeEstimator and the
+    // rest of the SDK — so large resource fees never lose precision to
+    // IEEE-754 rounding (see #447). `estimateRequiredFee` handles the
+    // minResourceFee/fee extraction with the same fallback used elsewhere.
+    const resourceFee = estimateRequiredFee(simResult);
+    const cpuInstructions = BigInt(simResult.cost?.cpuInsns ?? 0);
 
     return {
-      totalFee: Number(BASE_FEE) + resourceFee,
+      totalFee: BigInt(BASE_FEE) + resourceFee,
       resourceFee,
-      baseFee: Number(BASE_FEE),
+      baseFee: BigInt(BASE_FEE),
       instructions: cpuInstructions,
     };
   }
@@ -651,7 +656,7 @@ export class StreamsModule {
   // Private helpers
 
   private _ensureCanMutate(): void {
-    if (!this.activeWallet && !this.config.signer && !this.config.keypair) {
+    if (!this.activeWallet && !this._signer() && !this.config.keypair) {
       throw new Error('keypair, wallet adapter, or signer is required for mutating operations');
     }
   }
@@ -660,8 +665,9 @@ export class StreamsModule {
     if (this.activeWallet) {
       return this.activeWallet.getPublicKey();
     }
-    if (this.config.signer) {
-      return this.config.signer.publicKey();
+    const signer = this._signer();
+    if (signer) {
+      return signer.publicKey();
     }
     if (this.config.keypair) {
       return this.config.keypair.publicKey();
@@ -682,8 +688,9 @@ export class StreamsModule {
       }
       return signed;
     }
-    if (this.config.signer) {
-      const result = this.config.signer.sign(tx);
+    const signer = this._signer();
+    if (signer) {
+      const result = signer.sign(tx);
       if (result != null) {
         await result;
       }

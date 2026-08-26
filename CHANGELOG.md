@@ -15,9 +15,14 @@ All notable changes are documented here. Format based on [Keep a Changelog](http
 - `FactoryModule.streamAddress()` now caches resolved stream→contract-address lookups in-memory, since the mapping is fixed at stream creation and never changes. Eliminates redundant RPC round trips on every `StreamsModule` read/write operation (`get`, `withdraw`, `cancel`, `pause`, `resume`, `topUp`, `clawback`) and on each page of `list()`, which previously re-resolved the same address for every stream on every call.
 - `buildBatchTransactions()` (the RPC-prepared batch path) now simulates all operations in a batch concurrently instead of one at a time, cutting the wall-clock time of an N-operation batch from N sequential RPC round trips to one.
 
+### Changed
+- `StreamsModule` now routes all signer-selection logic through its private `_signer()` helper instead of touching `config.signer` directly, removing dead code (#446).
+- CAIP-2→network mapping consolidated into a single exported `CAIP2_TO_NETWORK` constant shared by `ConduitClient`'s wallet network check and `WalletConnectAdapter`'s chain validation, so the two can never disagree (#445).
+
 ### Removed
 - Removed orphaned `RoomManager` (`src/room-manager.js`) and `src/server.js` WebSocket server, along with unused `dotenv` production dependency (#442).
 - Removed unused `GraphSyncAgent` (`src/graph-sync-agent.ts`) dead code (#443).
+- Removed the superseded `src/nonce-manager.ts` `NonceManager` (and its test) — it was an earlier, unmaintained number-based implementation shadowed by the bigint-based `src/nonce/NonceManager.ts` (#444).
 
 ### Documentation
 - Removed non-existent `contracts/*-abi.ts` entry from `docs/architecture.md` module map (#440).
@@ -27,6 +32,7 @@ All notable changes are documented here. Format based on [Keep a Changelog](http
 - Documented `ConduitClient`'s `pauseStream()`, `unpauseStream()`, and `setWallet()` convenience methods in `docs/api.md`, and fixed `setWallet()`'s JSDoc block, which had been orphaned above `pauseStream()`/`unpauseStream()` and left `setWallet()` itself undocumented.
 
 ### Fixed
+- `StreamsModule.estimateFee()` now returns `FeeEstimate` fees as bigint stroops — consistent with `FeeEstimator` and the rest of the SDK — eliminating IEEE-754 precision loss on large resource fees (#447)
 - `StreamsModule.withdraw()` / `topUp()` now reject `amount <= 0n` client-side (before any RPC round-trip), matching `create()`'s fail-fast validation philosophy instead of relying on the contract's `InvalidAmount` simulate+reject cycle (#451)
 - `StreamsModule.list()` no longer silently drops `recipient` when both `sender` and `recipient` are provided — it now returns the de-duplicated union of both filters (#452)
 - **Critical:** `FeeEstimator.estimateFee()` now uses `bigint` stroops instead of floating-point for fee representation, eliminating IEEE-754 precision loss. All monetary amounts in the SDK now consistently use bigint to avoid rounding errors.
