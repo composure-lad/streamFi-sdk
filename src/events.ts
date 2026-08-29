@@ -41,14 +41,14 @@ function tupleFields(val: xdr.ScVal): xdr.ScVal[] {
   return val.vec() ?? [];
 }
 
-function i128Field(fields: xdr.ScVal[], index: number): bigint {
+function i128Field(fields: xdr.ScVal[], index: number): bigint | undefined {
   const field = fields[index];
-  return field ? scValToI128(field) : 0n;
+  return field ? scValToI128(field) : undefined;
 }
 
-function u64Field(fields: xdr.ScVal[], index: number): number {
+function u64Field(fields: xdr.ScVal[], index: number): number | undefined {
   const field = fields[index];
-  return field ? Number(scValToU64(field)) : 0;
+  return field ? Number(scValToU64(field)) : undefined;
 }
 
 /**
@@ -87,6 +87,9 @@ export function subscribeToStream(
   let   cursor: string | undefined;
   let   stopped      = false;
   let   timer: ReturnType<typeof setTimeout> | undefined;
+  // Last per-contract event sequence seen (topics[2]), for gap detection
+  // across a poll or reconnect — see contracts/stream/src/events.rs.
+  let   lastSequence: bigint | undefined;
 
   async function poll() {
     if (stopped) return;
@@ -103,17 +106,25 @@ export function subscribeToStream(
 
       if (response.events.length > 0) {
         for (const event of response.events) {
-          dispatchEvent(event, handlers);
+          const sequence = dispatchEvent(event, handlers);
+          if (sequence !== undefined) {
+            if (lastSequence !== undefined && sequence !== lastSequence + 1n) {
+              try {
+                handlers.onGap?.({ expected: lastSequence + 1n, actual: sequence });
+              } catch (handlerError) {
+                console.warn('[conduit-sdk] event polling onGap handler error:', handlerError);
+              }
+            }
+            lastSequence = sequence;
+          }
         }
       }
 
-      // Soroban RPC returns a cursor in the response, but
-      // @stellar/stellar-sdk's GetEventsResponse type (v12.x) does not
-      // declare it — read it through a narrow cast so multi-page event
-      // polling keeps working (see #422).
-      const nextCursor = (response as { cursor?: string }).cursor;
-      if (nextCursor) {
-        cursor = nextCursor;
+      // `@stellar/stellar-sdk`'s GetEventsResponse type doesn't declare `cursor`
+      // yet, though the RPC returns it — read it defensively.
+      const responseCursor = (response as { cursor?: string }).cursor;
+      if (responseCursor) {
+        cursor = responseCursor;
       } else {
         cursor = undefined;
         if (response.latestLedger !== undefined) {
@@ -160,17 +171,20 @@ export function subscribeToStream(
 
 // Exported (but not re-exported from index.ts) so tests can exercise the
 // tuple-decoding logic directly without standing up a fake RPC server.
+// Returns the event's sequence number (topics[2]) so callers can track gaps
+// across polls/reconnects, or undefined if the event had no topics at all.
 export function dispatchEvent(
   event:    SorobanRpc.Api.EventResponse,
   handlers: StreamEventHandlers,
-): void {
-  // Topics: [symbol, actor_address]
+): bigint | undefined {
+  // Topics: [symbol, actor_address, sequence]
   const topics = event.topic;
-  if (!topics || topics.length < 1) return;
+  if (!topics || topics.length < 1) return undefined;
 
   const topicName = topics[0]?.sym()?.toString() ?? '';
 
-  const actor = addressField(topics[1]);
+  const actor    = addressField(topics[1]);
+  const sequence = topics[2] ? scValToU64(topics[2]) : 0n;
 
   switch (topicName) {
     case TOPIC.WITHDRAWN: {
@@ -182,6 +196,7 @@ export function dispatchEvent(
         amount:         i128Field(fields, 0),
         totalWithdrawn: i128Field(fields, 1),
         remaining:      i128Field(fields, 2),
+        sequence,
       };
       handlers.onWithdraw(data);
       break;
@@ -195,6 +210,7 @@ export function dispatchEvent(
         sender:         actor,
         refundAmount:   i128Field(fields, 0),
         withdrawnSoFar: i128Field(fields, 1),
+        sequence,
       };
       handlers.onCancel(data);
       break;
@@ -208,6 +224,7 @@ export function dispatchEvent(
         sender:       actor,
         pausedAt:     u64Field(fields, 0),
         withdrawable: i128Field(fields, 1),
+        sequence,
       };
       handlers.onPause(data);
       break;
@@ -220,6 +237,7 @@ export function dispatchEvent(
       const data: ResumeEvent = {
         sender:    actor,
         resumedAt: Number(scValToU64(event.value)),
+        sequence,
       };
       handlers.onResume(data);
       break;
@@ -233,6 +251,7 @@ export function dispatchEvent(
         sender:     actor,
         amount:     i128Field(fields, 0),
         newBalance: i128Field(fields, 1),
+        sequence,
       };
       handlers.onTopUp(data);
       break;
@@ -244,9 +263,12 @@ export function dispatchEvent(
       const data: ClawbackEvent = {
         sender: actor,
         amount: scValToI128(event.value),
+        sequence,
       };
       handlers.onClawback(data);
       break;
     }
   }
+
+  return sequence;
 }

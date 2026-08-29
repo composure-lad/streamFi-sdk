@@ -52,7 +52,7 @@ export class StreamBuilder {
   private _token?: string | undefined;
   private _sender?: string | undefined;
   private _recipient?: string | undefined;
-  private _amount?: number | undefined;
+  private _amount?: number | bigint | undefined;
   private _ratePerSecond?: number | bigint | undefined;
 
   private pendingQueue: Array<Record<string, unknown>> = [];
@@ -98,12 +98,21 @@ export class StreamBuilder {
 
   /**
    * Sets the amount of tokens to stream.
+   * Accepts a number or bigint; bigint values are serialised to
+   * strings before network submission to avoid Safari/WebKit
+   * JSON.stringify quirks.
    * @param val - The amount in the token's smallest unit.
    * @returns The builder instance for chaining.
    */
-  amount(val: number): this {
-    if (!Number.isFinite(val) || val <= 0) {
-      throw new Error('Invalid StreamBuilder parameter: amount must be a positive finite number');
+  amount(val: number | bigint): this {
+    if (typeof val === 'bigint') {
+      if (val <= 0n) {
+        throw new Error('Invalid StreamBuilder parameter: amount must be a positive value');
+      }
+    } else {
+      if (!Number.isFinite(val) || val <= 0) {
+        throw new Error('Invalid StreamBuilder parameter: amount must be a positive finite number');
+      }
     }
     this._amount = val;
     return this;
@@ -153,10 +162,17 @@ export class StreamBuilder {
       token: this._token,
       sender: this._sender,
       recipient: this._recipient,
-      amount: this._amount,
+      amount: typeof this._amount === 'bigint' ? this._amount.toString() : this._amount,
     };
     if (this._ratePerSecond !== undefined && this._ratePerSecond !== null) {
-      config.ratePerSecond = this._ratePerSecond;
+      // build()'s return type promises `ratePerSecond?: string`, but
+      // bigintSafeStringify() only stringifies `bigint` values — a `number`
+      // input would otherwise pass through unchanged and lie about its type
+      // at runtime. Coerce numeric inputs here so the declared type is
+      // honest (see #459).
+      config.ratePerSecond = typeof this._ratePerSecond === 'number'
+        ? String(this._ratePerSecond)
+        : this._ratePerSecond;
     }
 
     return bigintSafeStringify(config) as {
@@ -415,14 +431,6 @@ function validatePayload(streams: unknown): string[] {
       // Field-level validation for known address-type fields
       const obj = item as Record<string, unknown>;
 
-      // Required field checks — token, sender, recipient, amount must all be present
-      const REQUIRED_FIELDS = ['token', 'sender', 'recipient', 'amount'] as const;
-      for (const field of REQUIRED_FIELDS) {
-        if (obj[field] === undefined || obj[field] === null) {
-          errors.push(`Batch item at index ${i}: missing required field "${field}"`);
-        }
-      }
-
       // Validate token field — must be a valid Soroban contract ID (C-address)
       if (obj.token !== undefined && obj.token !== null) {
         const token = String(obj.token);
@@ -537,7 +545,22 @@ export class ConduitBatcher {
     }
 
     const method = options.method ?? 'create_stream';
-    const operations = sanitized.map(params => ({ method, params }));
+    const operations = sanitized.map(params => {
+      if (method === 'create_stream') {
+        const args = [
+          params.sender,
+          params.recipient,
+          params.token,
+          params.amount,
+          params.ratePerSecond,
+          0, // start_time
+          0, // end_time
+          false, // clawback
+        ];
+        return { method, args };
+      }
+      return { method, params };
+    });
 
     try {
       return toBatchResult(buildBatchTransactionsSync(operations, options.context), chunks);
