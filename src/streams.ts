@@ -3,7 +3,6 @@
  */
 
 import { SorobanRpc, nativeToScVal, xdr, Address, Transaction, BASE_FEE, Asset } from '@stellar/stellar-sdk';
-import type { Signer } from './signer.js';
 import type {
   ConduitConfig,
   CreateStreamParams,
@@ -25,6 +24,7 @@ import {
   buildContractCallTx,
   scValToI128,
   scValToU64,
+  scValToU32,
   boolToScVal,
   getTokenDecimals,
   catchNetworkError,
@@ -36,6 +36,11 @@ import {
   DEFAULT_CONFIRMATION_POLL_INTERVAL_MS,
   createRpcServer,
 } from './soroban.js';
+import {
+  STREAM_FLAG_PAUSED,
+  STREAM_FLAG_CANCELLED,
+  STREAM_FLAG_CLAWBACK_ENABLED,
+} from './constants.js';
 import { FactoryModule } from './factory.js';
 import { ConduitError, RateLimitError, InsufficientBalanceError, StreamErrorCode } from './errors.js';
 
@@ -74,7 +79,6 @@ import { ZERO_ADDR, DEFAULT_LIST_LIMIT, clampListLimit, USDC_ISSUER } from './co
 export class StreamsModule {
   private readonly rpcUrl:     string;
   private readonly passphrase: string;
-  private readonly callerAddr: string;
   private readonly _factory:   FactoryModule;
   private activeWallet?:       WalletAdapter;
 
@@ -105,7 +109,6 @@ export class StreamsModule {
   constructor(private readonly config: ConduitConfig) {
     this.rpcUrl     = config.rpcUrl ?? DEFAULT_RPC[config.network];
     this.passphrase = NETWORK_PASSPHRASE[config.network];
-    this.callerAddr = this._signerPublicKey();
     this._factory   = new FactoryModule(config);
 
     if (config.wallet) {
@@ -141,9 +144,9 @@ export class StreamsModule {
 
   /**
    * Resolve the caller address, handling both sync and async getPublicKey().
-   * Unlike _signerPublicKey(), this can be used when the wallet adapter
-   * returns a promise - but it MUST only be called from async contexts.
-   * Results are cached per wallet configuration and invalidated on setWallet().
+   * Safe when the wallet adapter returns a promise — but it MUST only be
+   * called from async contexts. Results are cached per wallet configuration
+   * and invalidated on setWallet().
    */
   private async _resolveCallerAddress(): Promise<string> {
     if (this._cachedCallerAddr !== null) {
@@ -657,7 +660,11 @@ export class StreamsModule {
     const address = await this._factory.streamAddress(BigInt(streamId));
     if (!address) throw new Error(`Stream ${streamId} not found`);
     const { subscribeToStream } = await import('./events.js');
-    return subscribeToStream(this.config.rpcUrl!, address, handlers);
+    // Use the resolved `this.rpcUrl` (constructor: `config.rpcUrl ??
+    // DEFAULT_RPC[config.network]`), not the raw optional `config.rpcUrl` —
+    // otherwise a client built without an explicit rpcUrl passes `undefined`
+    // to `createRpcServer`, which throws / never connects.
+    return subscribeToStream(this.rpcUrl, address, handlers);
   }
 
   /** Synchronous subscribe - resolves address lazily on first poll tick. */
@@ -829,6 +836,13 @@ function parseStreamInfo(id: bigint, address: string, val: xdr.ScVal): StreamInf
     const k = e.key().sym()?.toString('utf8') ?? e.key().str()?.toString('utf8') ?? '';
     m[k] = e.val();
   }
+  // `paused`, `cancelled` and `clawback_enabled` are NOT fields on the
+  // on-chain `StreamInfo` struct — they are bits packed into `flags: u32`
+  // (see contracts/stream/src/storage.rs). Reading `m['paused']` etc. always
+  // yields `undefined`; derive the booleans by masking `flags`, mirroring
+  // `StreamInfo::is_paused()` / `is_cancelled()` / `is_clawback_enabled()`.
+  const flags = m['flags'] ? scValToU32(m['flags']) : 0;
+
   const info: StreamInfo = {
     id,
     address,
@@ -839,10 +853,10 @@ function parseStreamInfo(id: bigint, address: string, val: xdr.ScVal): StreamInf
     startTime:       m['start_time']      ? Number(scValToU64(m['start_time']))               : 0,
     endTime:         m['end_time']        ? Number(scValToU64(m['end_time']))                 : 0,
     withdrawn:       m['withdrawn']       ? scValToI128(m['withdrawn'])                       : 0n,
-    paused:          m['paused']?.b()     ?? false,
+    paused:          (flags & STREAM_FLAG_PAUSED) !== 0,
     pausedAt:        m['paused_at']       ? Number(scValToU64(m['paused_at']))                : 0,
-    cancelled:       m['cancelled']?.b()  ?? false,
-    clawbackEnabled: m['clawback_enabled']?.b() ?? false,
+    cancelled:       (flags & STREAM_FLAG_CANCELLED) !== 0,
+    clawbackEnabled: (flags & STREAM_FLAG_CLAWBACK_ENABLED) !== 0,
   };
   (info as StreamInfo & { toJSON(): Record<string, unknown> }).toJSON = () => bigintSafeStringify(info as unknown as Record<string, unknown>);
   return info;
